@@ -109,7 +109,8 @@ extern uint16_t mqttPublishIntervalSec;
 extern bool mqttConnected;
 extern String mqttLastError;
 extern bool isStreamScheduleAllowedNow(bool* timeValidOut);
-extern const char* MDNS_HOSTNAME;
+extern String mdnsHostname;
+extern bool applyMdnsHostname(const String &raw);
 extern bool attemptTimeSync(bool logResult, bool quickMode);
 extern String formatDateTime();
 extern void configureTimeService(bool enableNtp);
@@ -209,7 +210,7 @@ static void httpStatus() {
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"stream_url_ip\":\"rtsp://" + WiFi.localIP().toString() + ":8554/audio\",";
-    json += "\"stream_url_mdns\":\"rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio\",";
+    json += "\"stream_url_mdns\":\"rtsp://" + mdnsHostname + ".local:8554/audio\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel),1) + ",";
     json += "\"free_heap_kb\":" + String(ESP.getFreeHeap()/1024) + ",";
@@ -222,6 +223,7 @@ static void httpStatus() {
     json += "\"utc_time\":\"" + jsonEscape(utcTimeStr) + "\",";
     json += "\"time_offset_min\":" + String(timeOffsetMinutes) + ",";
     json += "\"mdns_enabled\":" + String(mdnsEnabled?"true":"false") + ",";
+    json += "\"mdns_hostname\":\"" + jsonEscape(mdnsHostname) + "\",";
     json += "\"mqtt_enabled\":" + String(mqttEnabled?"true":"false") + ",";
     json += "\"mqtt_connected\":" + String(mqttConnected?"true":"false") + ",";
     json += "\"mqtt_host\":\"" + jsonEscape(mqttHost) + "\",";
@@ -682,6 +684,12 @@ static void httpSet() {
         handled = true;
         String v = web.arg("value");
         if (v == "on" || v == "off") { mdnsEnabled = (v == "on"); applyMdnsSetting(); saveAudioSettings(); applied = true; }
+    }
+    else if (key == "mdns_hostname") {
+        handled = true;
+        String v = web.arg("value");
+        v.trim();
+        if (applyMdnsHostname(v)) applied = true;
     }
     else if (key == "mqtt_enable") {
         handled = true;
