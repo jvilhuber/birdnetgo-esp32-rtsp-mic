@@ -33,7 +33,10 @@ unsigned long lastTimeSyncSuccess = 0;   // millis() of last success
 int32_t timeOffsetMinutes = 0;           // user-set offset applied to displayed time
 
 // mDNS
-const char* MDNS_HOSTNAME = "esp32mic"; // results in esp32mic.local
+#define DEFAULT_MDNS_HOSTNAME "esp32mic"      // default results in esp32mic.local
+static const uint8_t MDNS_HOSTNAME_MIN_LEN = 1;
+static const uint8_t MDNS_HOSTNAME_MAX_LEN = 63; // RFC 952/1123 label limit
+String mdnsHostname = DEFAULT_MDNS_HOSTNAME;
 bool mdnsEnabled = true;
 bool mdnsRunning = false;
 
@@ -402,6 +405,25 @@ static String sanitizeMqttClientId(const String &input, const String &fallback) 
         out += c;
     }
     if (out.length() == 0) return fallback;
+    return out;
+}
+
+// Sanitize an mDNS hostname to a single DNS label (RFC 952/1123):
+// allow [a-z0-9-], lowercase, no leading/trailing dash, 1..63 chars.
+static String sanitizeMdnsHostname(const String &input, const String &fallback) {
+    String out;
+    out.reserve(input.length());
+    for (size_t i = 0; i < input.length(); ++i) {
+        char c = input[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+            out += c;
+        }
+    }
+    if (out.length() > MDNS_HOSTNAME_MAX_LEN) out.remove(MDNS_HOSTNAME_MAX_LEN);
+    while (out.length() && out[0] == '-') out.remove(0, 1);
+    while (out.length() && out[out.length() - 1] == '-') out.remove(out.length() - 1, 1);
+    if (out.length() < MDNS_HOSTNAME_MIN_LEN) return fallback;
     return out;
 }
 
@@ -1419,6 +1441,9 @@ void loadAudioSettings() {
     timeOffsetMinutes = audioPrefs.getInt("timeOffset", 0);
     timeSyncEnabled = audioPrefs.getBool("timeSyncEn", true);
     mdnsEnabled = audioPrefs.getBool("mdnsEn", true);
+    mdnsHostname = sanitizeMdnsHostname(
+        audioPrefs.getString("mdnsHost", DEFAULT_MDNS_HOSTNAME),
+        DEFAULT_MDNS_HOSTNAME);
     streamScheduleEnabled = audioPrefs.getBool("strSchedEn", false);
     streamScheduleStartMin = (uint16_t)audioPrefs.getUInt("strSchStart", 0);
     streamScheduleStopMin = (uint16_t)audioPrefs.getUInt("strSchStop", 0);
@@ -1498,6 +1523,7 @@ void saveAudioSettings() {
     audioPrefs.putInt("timeOffset", timeOffsetMinutes);
     audioPrefs.putBool("timeSyncEn", timeSyncEnabled);
     audioPrefs.putBool("mdnsEn", mdnsEnabled);
+    audioPrefs.putString("mdnsHost", mdnsHostname);
     audioPrefs.putBool("strSchedEn", streamScheduleEnabled);
     audioPrefs.putUInt("strSchStart", streamScheduleStartMin);
     audioPrefs.putUInt("strSchStop", streamScheduleStopMin);
@@ -1527,7 +1553,7 @@ void applyMdnsSetting() {
         return;
     }
     if (mdnsRunning) return;
-    if (!MDNS.begin(MDNS_HOSTNAME)) {
+    if (!MDNS.begin(mdnsHostname.c_str())) {
         simplePrintln("mDNS start failed");
         mdnsRunning = false;
         return;
@@ -1535,7 +1561,29 @@ void applyMdnsSetting() {
     MDNS.addService("http", "tcp", 80);
     MDNS.addService("rtsp", "tcp", 8554);
     mdnsRunning = true;
-    simplePrintln("mDNS ready: http://" + String(MDNS_HOSTNAME) + ".local/ ; rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio");
+    simplePrintln("mDNS ready: http://" + mdnsHostname + ".local/ ; rtsp://" + mdnsHostname + ".local:8554/audio");
+}
+
+// Apply a new mDNS hostname. Sanitizes the request, persists it, and
+// republishes mDNS so the new name is reachable without a reboot.
+// Returns true if the hostname was valid and applied (even if unchanged).
+// OTA latches its hostname at boot, so ArduinoOTA picks up the change
+// only on the next restart.
+bool applyMdnsHostname(const String &raw) {
+    String sanitized = sanitizeMdnsHostname(raw, mdnsHostname);
+    if (sanitized.length() < MDNS_HOSTNAME_MIN_LEN ||
+        sanitized.length() > MDNS_HOSTNAME_MAX_LEN) {
+        return false;
+    }
+    if (sanitized == mdnsHostname) return true;
+    mdnsHostname = sanitized;
+    if (mdnsRunning) {
+        MDNS.end();
+        mdnsRunning = false;
+    }
+    applyMdnsSetting();
+    saveAudioSettings();
+    return true;
 }
 
 // Schedule a safe reboot (optionally with factory reset) after delayMs
@@ -1591,6 +1639,7 @@ void resetToDefaultSettings() {
     lastTemperatureValid = false;
     timeOffsetMinutes = 0;
     mdnsEnabled = true;
+    mdnsHostname = DEFAULT_MDNS_HOSTNAME;
     streamScheduleEnabled = false;
     streamScheduleStartMin = 0;
     streamScheduleStopMin = 0;
@@ -1658,8 +1707,10 @@ void simplePrintln(String message) {
 
 // OTA setup
 void setupOTA() {
-    // Keep OTA hostname aligned with our mDNS hostname to avoid multiple .local names
-    ArduinoOTA.setHostname(MDNS_HOSTNAME);
+    // Keep OTA hostname aligned with our mDNS hostname to avoid multiple .local names.
+    // OTA latches this at begin(), so a hostname change via the Web UI takes effect
+    // only after a reboot.
+    ArduinoOTA.setHostname(mdnsHostname.c_str());
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
 #endif
@@ -2096,7 +2147,7 @@ void setup() {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio");
         if (mdnsEnabled) {
-            simplePrintln("RTSP URL (mDNS): rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio");
+            simplePrintln("RTSP URL (mDNS): rtsp://" + mdnsHostname + ".local:8554/audio");
         }
         simplePrintln("You can stream via IP or mDNS (if enabled).");
     } else if (overheatLatched) {
